@@ -5,85 +5,91 @@ use Reflection;
 use ReflectionMethod;
 
 class DB {
-  protected $select, $joins, $where, $orderBy, $limit;
-  
   protected $table;
   protected $primaryKey;
   protected $fillable;
   protected $hidden;
 
-  protected $query;
+  protected $bindings = [
+    'select' => [],
+    'join'  => [],
+    'where'  => [],
+    'orderBy'=> [],
+    'limit'  => [],
+  ];
+
+  public $operators = [
+    '=', '<', '>', '<=', '>=', '<>', '!=', '<=>',
+    'like', 'like binary', 'not like', 'ilike',
+    '&', '|', '^', '<<', '>>', '&~', 'is', 'is not',
+    'rlike', 'not rlike', 'regexp', 'not regexp',
+    '~', '~*', '!~', '!~*', 'similar to',
+    'not similar to', 'not ilike', '~~*', '!~~*',
+    'in', 'not in'
+  ];
 
   protected $tokens = [];
+  protected $query;
   protected $instance;
 
   function __construct($table = '')
   {
-    // Para establecer la conexión
     $this->table = $table;
-    $this->select = $this->joins = $this->where = $this->orderBy = $this->limit = [];
   }
 
   public static function table($table = '') 
   {
     if ( !(is_string($table) && !empty($table)) ) throw new \Exception('Tabla no definida', 1);
     
-    $instance = new DB($table);
-
-    return $instance;
+    return new DB($table);
   }
 
   public function select(...$columns)
   {
-    foreach ( $columns as $column ) $this->select []= $column;
-    
+    foreach ( $columns as $column ) $this->addBinding('select', $column);
+
     return $this;
   }
 
   public function selectRaw($query = '')
   {
-    $this->select []= $query;
+    if ( !is_string($query) ) throw new \Exception("Se esperaba una cadena (string)", 1);
 
-    return $this;
+    return $this->addBinding('select', $query);
   }
 
   public function where(...$conditions)
   { 
-    $boolean = is_bool(end($conditions)) ? array_pop($conditions) : true;
-    $boolean = empty($this->where) ? '' : ( $boolean ? 'AND ' : 'OR ');
-
-    if ( in_array(count($conditions, COUNT_RECURSIVE), [1,2]) ) {
-      
-      if ( count($conditions) == 1 ) {
-        $this->where []= $boolean . $conditions[0]; 
-      } else {
-        list($key, $value) = $conditions;
-
-        $this->where []= $boolean . implode(" = :", array_fill(0, 2, $key));
-        $this->tokens[':' . $key] = $value;
-      }
+    $boolean = $this->findOrFailBoolean($conditions);
+    if ( $boolean !== null ) array_pop($conditions);
+    $condition = ( !empty($this->bindings['where'])  ) ? ( $boolean === false ? 'OR' : 'AND' ) : '';
     
-    } else if ( count($conditions, COUNT_RECURSIVE) == 3 ) {
+    $operator = $this->findOrFailOperator($conditions);
+    if ( $operator !== null ) unset($conditions[1]);
+    $operator = $operator ?: '=';
 
-      list($key, $condition, $value) = $conditions;
+    // reset $conditions 
+    $conditions = array_values($conditions);
+    
+    if ( count($conditions) == 1 ) {
+      $this->bindings['where'] []= $boolean . reset($conditions);
+    } else {
+      list($key, $value) = $conditions;
 
-      if ( !in_array(strtoupper($condition), ['IN', 'NOT IN']) ) {
-        $this->where []= $boolean . implode( " $condition :", array_fill(0, 2, $key));
-        $this->tokens[':' . $key] = $value;
-      } else {
-        $values = [];
-        $keysvalues = [];
+      if ( in_array(strtoupper($operator), ['IN', 'NOT IN']) ) {
+        $values = $keysvalues = [];
 
         foreach ( explode(',', $value) as $k => $v) {
           $values[":" . $key . $k] =  $v;
           $keysvalues []= ":" . $key . $k;
         }
 
-        $this->where []= $boolean . $key . " $condition (" . implode(', ', $keysvalues) . ")";
+        $this->bindings['where'] []= "$condition $key $operator (" . implode(', ', $keysvalues) . ")";
         array_push($this->tokens, $values);
+      } else {
+        $this->bindings['where'] []= "$condition " . implode(" $operator :", array_fill(0, 2, $key));
+        $this->tokens[':' . $key] = $value;
       }
-    } else {
-      throw new \Exception("Número de valores no permitido", 1);
     }
 
     return $this;
@@ -100,13 +106,27 @@ class DB {
 
   public function join(...$conditions)
   {
-    $typeJoin = ( count($conditions, COUNT_RECURSIVE) > 4 ) ? array_pop($conditions) . ' JOIN' : 'INNER JOIN';
+    $typeJoin = ( is_string(end($conditions)) && in_array( strtoupper( end($conditions) ), ['RIGHT', 'LEFT', 'INNER']) ) ? array_pop($conditions) : 'INNER';
+    
+    if ( count( array_filter($conditions, 'is_array') ) > 0 ) {
+
+      if ( count( array_filter($conditions[0], 'is_array') ) > 0 ) $conditions = $conditions[0];
+
+      foreach ( $conditions as $condition ) {
+        if ( (count($condition) > 4) === false ) array_push($condition, $typeJoin);
+        call_user_func_array([$this, 'join'], $condition);
+      }
+      
+      return $this;
+    }
+
+    $typeJoin .= ' JOIN';
 
     if ( count($conditions, COUNT_RECURSIVE) !== 4 ) throw new \Exception("Longitud no permitida en join", 1);
     
     list($table, $column1, $operator, $column2) = $conditions;
 
-    $this->joins []= "$typeJoin $table ON $column1 $operator $column2";
+    $this->addBinding('join', "$typeJoin $table ON $column1 $operator $column2");
     
     return $this;
   }
@@ -137,43 +157,62 @@ class DB {
   } 
 
   public function orderBy(...$order) {
-    if ( !empty($order) ) $this->orderBy []= implode(' ', $order);
+    if ( !empty($order) ) $this->bindings['orderBy'] []= implode(' ', $order);
 
     return $this;
   }
 
   public function limit( $count = 0 ) {
-    if ( !empty($count) ) $this->limit = [$count];
+    if ( !empty($count) ) $this->bindings['limit'] = [$count];
 
     return $this;
   }
 
   public function get() {
-    // $this->db( $this->convertToSql(), $this->tokens );
-
   }
 
   public function find($id) {
     // return $id;
   }
-  
-  private function convertToSql() 
-  {
-    $select = 'SELECT ' . implode(', ', $this->select);
-    $from  = 'FROM ' . $this->table;
-    $joins = implode(' ', $this->joins);
-    $where = 'WHERE ' . implode(' ', $this->where);
-    $orderBy = !empty($this->orderBy) ? 'ORDER BY ' . implode(', ', $this->orderBy) : '';
-    $limit = !empty($this->limit) ? 'LIMIT ' . implode(' ', $this->limit) : '';
 
-    $this->query = implode(' ', compact('select','from', 'joins', 'where', 'orderBy', 'limit'));
+  private function addBinding($binding, $data = '') {
+    if ( !in_array($binding, array_keys($this->bindings)) ) throw new \Exception("No existe atadura $binding", 1);
+    if ( !is_string($data) ) throw new \Exception("No se puede guardar arregos de arrays", 1);
+    
+    $this->bindings[$binding] []= $data;
+
+    return $this;
+  }
+  
+  private function getSQL() 
+  {
+    $select  = !empty($this->bindings['select'])  ? 'SELECT ' . implode(', ', $this->bindings['select']) : '*';
+    $from    = 'FROM ' . $this->table;
+    $joins   = !empty($this->bindings['join'])    ? implode(' ', $this->bindings['join']) : '';
+    $where   = !empty($this->bindings['where'])   ? 'WHERE ' . implode(' ', $this->bindings['where']) : '';
+    $orderBy = !empty($this->bindings['orderBy']) ? 'ORDER BY ' . implode(', ', $this->bindings['orderBy']) : '';
+    $limit   = !empty($this->bindings['limit'])   ? 'LIMIT ' . implode('', $this->bindings['limit']) : '';
+
+    return $this->query = implode(' ', compact('select','from', 'joins', 'where', 'orderBy', 'limit'));
+  }
+
+  private function findOrFailBoolean($array)
+  {
+    $end = array_pop($array);
+    return is_bool($end) ? $end : null; 
+  }
+
+  private function findOrFailOperator($array)
+  {
+    $count = count($array, COUNT_RECURSIVE);
+    $operator = array_search(strtolower($array[floor($count/2)]), $this->operators);
+
+    return ($operator !== false) ? strtoupper($this->operators[$operator]) : null; 
   }
 
   private function __toString()
   {
-    $this->convertToSql();
-    
-    return $this->query;
+    return $this->getSQL();
   }
 
   private function __call($method, $arguments)
@@ -192,15 +231,17 @@ class DB {
 }
 
 $socio = DB::table('socios');
-
 $socio->select('nombre', 'apellidos', 'telefono')
-->leftJoin('leads', 'leads.email', '=', 'socios.email')
-->rightJoin('registros', 'leads.email', '=', 'registros.email')
-->where('email','luigui@dgtlfundraising')
-->where('idl', 'NOT IN','1,2,3,4')
-->whereRaw('fecha_ins BETWEEN NOW() AND NOW() - INTERVAL 1 DAY', false)
-->orderBy('email', 'DESC')
-->limit(1000);
+      ->join([
+              ['leads', 'leads.email', '=', 'socios.email', 'LEFT'],
+              ['socios', 'socios.email', '=', 'leads.email'], 
+              ['registros', 'leads.email', '=', 'registros.email', 'INNER']
+            ])
+      ->where('email','luigui@dgtlfundraising')
+      ->where('idl', 'NOT IN','1,2,3,4', false)
+      ->whereRaw('fecha_ins BETWEEN NOW() AND NOW() - INTERVAL 1 DAY', false)
+      ->orderBy('email', 'DESC')
+      ->limit(1000);
 
 echo $socio;
 ?>
